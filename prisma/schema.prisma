@@ -1,0 +1,114 @@
+// hadrontool-slack — the tool's OWN small database.
+//
+// Boundary (spec 043, inheriting the 042 decision): this tool owns everything
+// provider-specific — encrypted workspace tokens, the persist-before-ack
+// event inbox, idempotency records. It is Hadron-blind: no core tables, no
+// core API. hadron-server keeps only the connection identity record and runs
+// authorization BEFORE it ever calls this service; the only tool→core
+// channel is the normalized events ingress.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum ConnectionStatus {
+  ACTIVE
+  ERROR
+}
+
+enum InboxStatus {
+  PENDING
+  DEAD
+}
+
+/// One registered Slack workspace install of the Hadron app. The `id` is
+/// returned to hadron-server at creation time and is the `connectionId`
+/// every operation call carries.
+model Connection {
+  id       String @id @default(cuid())
+  provider String @default("slack")
+  /// Slack workspace (team) id, e.g. "T0123456789".
+  teamId   String @map("team_id")
+  teamName String @map("team_name")
+  /// The bot's Slack USER id ("U…") from auth.test — what appears as the
+  /// sender `user` on messages the bot posts.
+  botUserId String @map("bot_user_id")
+  /// The bot's BOT id ("B…") from auth.test — what bot message EVENTS carry
+  /// as `bot_id`. Distinct from botUserId; core's loop filter needs both
+  /// (spec 043 decision 8, PR #594 review).
+  botId String @map("bot_id")
+  /// AES-256-GCM-encrypted bot token (xoxb-…), under this tool's own
+  /// TOKEN_ENCRYPTION_KEY — never core's key.
+  botTokenEnc String @map("bot_token_enc")
+  /// AES-256-GCM-encrypted app-level token (xapp-…) — Socket Mode's
+  /// connection credential.
+  appTokenEnc String           @map("app_token_enc")
+  status      ConnectionStatus @default(ACTIVE)
+  /// Error message from the last permanent provider-auth failure.
+  lastError String? @map("last_error")
+  /// Soft toggle — operator can pause the socket without removing the install.
+  socketEnabled Boolean   @default(true) @map("socket_enabled")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+  deletedAt     DateTime? @map("deleted_at")
+
+  inboxEvents EventInbox[]
+
+  @@index([teamId])
+  @@map("connections")
+}
+
+/// Idempotency records for mutating operations (at-least-once callers).
+/// Created as an in-flight RESERVATION before the provider mutation runs
+/// (responseJson null), completed with the response after — so concurrent
+/// duplicates cannot both execute. A replayed completed key returns the
+/// stored response without touching the provider.
+model IdempotencyRecord {
+  key         String @id
+  operation   String
+  /// SHA-256 of the operation input — a key replayed with a DIFFERENT
+  /// payload is rejected instead of leaking the stored response.
+  requestHash String @map("request_hash")
+  /// JSON-serialized operation response; null while the original request is
+  /// still in flight.
+  responseJson String?  @map("response_json")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  @@index([createdAt])
+  @@map("idempotency_records")
+}
+
+/// The persist-before-ack buffer (spec 043 decision 5, PR #594 Codex
+/// review): a Socket Mode envelope is written HERE before it is acked —
+/// Slack never redelivers an acked envelope, so an ack without a durable
+/// record would silently drop slash commands on a crash or core outage.
+/// The drainer delivers PENDING rows to CORE_EVENTS_URL in arrival order,
+/// deletes them on 2xx, and marks them DEAD after bounded retries (kept for
+/// inspection). This is the durable buffer Telegram's 24h getUpdates queue
+/// gave hadrontool-telegram for free.
+model EventInbox {
+  id           String @id @default(cuid())
+  connectionId String @map("connection_id")
+  /// Socket Mode envelope id; synthetic (`gap:…`) for connection-lifecycle
+  /// events that have no envelope. Unique per connection = ingress dedupe.
+  envelopeId String @map("envelope_id")
+  /// The normalized event, JSON-serialized — exactly what the forwarder
+  /// POSTs to core.
+  eventJson String      @map("event_json")
+  attempts  Int         @default(0)
+  status    InboxStatus @default(PENDING)
+  /// Last delivery failure, for DEAD-row inspection.
+  lastError String?  @map("last_error")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  connection Connection @relation(fields: [connectionId], references: [id])
+
+  @@unique([connectionId, envelopeId])
+  @@index([status, createdAt])
+  @@map("event_inbox")
+}
