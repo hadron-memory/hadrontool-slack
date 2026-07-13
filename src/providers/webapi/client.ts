@@ -38,7 +38,6 @@ async function call<T extends Record<string, unknown>>(
   params: Record<string, unknown>,
 ): Promise<T> {
   let res: Response;
-  let body: ({ ok: boolean; error?: string } & T) | undefined;
   try {
     res = await fetch(`${config.slackApiBase}/${method}`, {
       method: 'POST',
@@ -49,14 +48,24 @@ async function call<T extends Record<string, unknown>>(
       body: JSON.stringify(params),
       signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
     });
-    body = (await res.json()) as typeof body;
   } catch (err) {
-    // Network failure / timeout / non-JSON body — transient by default.
+    // Network failure / timeout — transient by default.
     throw new SlackApiError(0, `network failure calling ${method}: ${String(err)}`);
   }
+  // Classify rate limits from the STATUS + header, BEFORE reading the body: a
+  // 429 can arrive with an empty or non-JSON body, and parsing it first would
+  // mask the rate limit as a generic network failure (provider_unavailable),
+  // dropping the retryAfter and the channel backoff.
   if (res.status === 429) {
     const retryAfter = Number(res.headers.get('retry-after') ?? '30');
     throw new SlackApiError(429, 'ratelimited', Number.isNaN(retryAfter) ? 30 : retryAfter);
+  }
+  let body: ({ ok: boolean; error?: string } & T) | undefined;
+  try {
+    body = (await res.json()) as typeof body;
+  } catch (err) {
+    // Non-JSON body on a non-429 response — transient by default.
+    throw new SlackApiError(0, `non-JSON body from ${method} (${res.status}): ${String(err)}`);
   }
   if (!body || body.ok !== true) {
     throw new SlackApiError(res.status, body?.error ?? `Web API ${method} failed (${res.status})`);

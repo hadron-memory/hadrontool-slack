@@ -23,11 +23,13 @@ import { withConnection } from '../connectionCall.js';
 import type { Db } from '../db.js';
 import {
   ProviderRateLimitedError,
+  ProviderUnavailableError,
   SlackToolError,
   ValidationError,
   mapSlackError,
   validationFromZod,
 } from '../errors.js';
+import { logError } from '../logger.js';
 import { recordProviderBackoff, reserveHistorySlot, reserveSendSlot } from '../pacing.js';
 import type { RawSlackMessage, SlackProvider } from '../providers/webapi/types.js';
 
@@ -164,8 +166,29 @@ const sendMessageSchema = channelRefSchema.extend({
   ephemeralUserId: z.string().optional(),
 });
 
+/**
+ * Slack response_urls are ALWAYS `https://hooks.slack.com/...`. The respond
+ * op is the one place the tool POSTs to a caller-supplied URL, so pin the
+ * host: without this, a caller (or a forged/replayed value) could turn the op
+ * into an SSRF vector against internal services or the cloud metadata
+ * endpoint. Add hosts here if Slack ever serves response_urls elsewhere.
+ */
+const RESPONSE_URL_HOSTS = new Set(['hooks.slack.com']);
+function isSlackResponseUrl(raw: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return false;
+  }
+  return url.protocol === 'https:' && RESPONSE_URL_HOSTS.has(url.hostname);
+}
+
 const respondSchema = connectionIdSchema.extend({
-  responseUrl: z.string().url(),
+  responseUrl: z
+    .string()
+    .url()
+    .refine(isSlackResponseUrl, { message: 'responseUrl must be an https hooks.slack.com URL' }),
   text: z.string().min(1).max(4000),
   choices: z.array(choiceSchema).min(1).max(25).optional(),
   replaceOriginal: z.boolean().optional(),
@@ -325,14 +348,63 @@ function canonical(v: unknown): unknown {
   return v;
 }
 
-/** Stable SHA-256 of an operation input for idempotency-payload matching. */
-function hashInput(input: Record<string, unknown>): string {
+/** Stable SHA-256 of an operation input for idempotency-payload matching. Exported for tests. */
+export function hashInput(input: Record<string, unknown>): string {
   return createHash('sha256').update(JSON.stringify(canonical(input))).digest('hex');
 }
 
 /** Prisma unique-violation check (P2002) — anything else is a real DB error. */
 function isUniqueViolation(err: unknown): boolean {
   return (err as { code?: string } | null)?.code === 'P2002';
+}
+
+/**
+ * How long a reservation may sit in-flight (responseJson null) before a
+ * retry treats it as ABANDONED and reclaims it. Comfortably above the
+ * longest a single op can legitimately run (≤5s inline pacing wait + a 15s
+ * provider timeout), so a genuinely in-flight request is never reclaimed.
+ */
+const STALE_RESERVATION_MS = 2 * 60 * 1000;
+
+/** Attempts to durably store a completed idempotency response before giving up. */
+const COMPLETION_STORE_ATTEMPTS = 3;
+
+/** Sleep helper for the completion-store backoff. */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Persist the completed response onto its reservation, with a bounded retry.
+ *
+ * The provider mutation has ALREADY succeeded by the time we get here, so a
+ * lost write is the dangerous case: it leaves the key stuck in-flight forever
+ * and a later retry can never replay the confirmed mutation. A transient DB
+ * blip is absorbed by the retry; if the write still cannot land, we surface a
+ * provider_unavailable (never a false success) and leave the reservation for
+ * the stale-reclaim path — a retry after STALE_RESERVATION_MS re-executes
+ * rather than hanging on "still in flight" indefinitely.
+ */
+async function storeCompletedResponse(db: Db, key: string, result: unknown): Promise<void> {
+  // `?? null`: JSON.stringify(undefined) is `undefined`, which Prisma OMITS
+  // from the update — the row would stay responseJson=NULL (in-flight)
+  // forever. Serialize an undefined result to the JSON literal "null".
+  const responseJson = JSON.stringify(result ?? null);
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < COMPLETION_STORE_ATTEMPTS; attempt++) {
+    try {
+      await db.idempotencyRecord.update({ where: { key }, data: { responseJson } });
+      return;
+    } catch (err) {
+      lastErr = err;
+      if (attempt < COMPLETION_STORE_ATTEMPTS - 1) await sleep(50 * (attempt + 1));
+    }
+  }
+  logError(
+    `idempotency: mutation succeeded but could not record its result for key ${key} after ${COMPLETION_STORE_ATTEMPTS} attempts (reservation left for stale-reclaim)`,
+    lastErr,
+  );
+  throw new ProviderUnavailableError();
 }
 
 /**
@@ -368,10 +440,35 @@ export async function runOperation(
       if (existing.operation !== name || existing.requestHash !== requestHash) {
         throw new ValidationError('idempotencyKey', 'key was already used for a different request');
       }
-      if (existing.responseJson == null) {
+      if (existing.responseJson != null) {
+        return { result: JSON.parse(existing.responseJson), replayed: true };
+      }
+      // Reservation exists but carries no response: either a genuinely
+      // in-flight duplicate, or an ABANDONED reservation whose original
+      // request crashed / lost its completion write. A fresh one is still
+      // running (retry shortly); a stale one is reclaimed and re-executed
+      // below, so a lost completion self-heals instead of poisoning the key
+      // forever. Re-execution may re-run the provider mutation — the
+      // at-least-once tradeoff a caller accepts by retrying with the key.
+      const ageMs = Date.now() - existing.createdAt.getTime();
+      if (ageMs < STALE_RESERVATION_MS) {
         throw new ValidationError('idempotencyKey', 'a request with this key is still in flight — retry shortly');
       }
-      return { result: JSON.parse(existing.responseJson), replayed: true };
+      // Claim the stale reservation ATOMICALLY: a conditional update that
+      // matches only while the row still carries the createdAt we observed
+      // (and no response). Under two concurrent reclaimers exactly one gets
+      // count===1 and re-executes; the loser sees count===0 (someone else
+      // bumped the clock or completed it) and backs off — so the
+      // "concurrent duplicate cannot also execute" guarantee holds even on
+      // the reclaim path. DB errors propagate (never swallowed).
+      const claim = await db.idempotencyRecord.updateMany({
+        where: { key: idempotencyKey!, responseJson: null, createdAt: existing.createdAt },
+        data: { createdAt: new Date() },
+      });
+      if (claim.count !== 1) {
+        throw new ValidationError('idempotencyKey', 'a request with this key is still in flight — retry shortly');
+      }
+      // Won the claim — fall through to re-execute.
     }
   }
 
@@ -389,9 +486,7 @@ export async function runOperation(
   }
 
   if (useIdempotency) {
-    await db.idempotencyRecord
-      .update({ where: { key: idempotencyKey! }, data: { responseJson: JSON.stringify(result) } })
-      .catch(() => {});
+    await storeCompletedResponse(db, idempotencyKey!, result);
   }
   return { result, replayed: false };
 }

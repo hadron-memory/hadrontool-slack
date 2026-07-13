@@ -7,7 +7,7 @@ import request from 'supertest';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { createApp } from '../app.js';
 import { db } from '../db.js';
-import { CHOICE_ACTION_ID } from '../ops/index.js';
+import { CHOICE_ACTION_ID, hashInput } from '../ops/index.js';
 import type { PostMessageParams } from '../providers/webapi/types.js';
 import { SlackApiError } from '../providers/webapi/types.js';
 import { createConnection, fakeProvider, rawMessage, resetDb } from '../test/fakes.js';
@@ -126,6 +126,78 @@ describe('POST /ops/send-message', () => {
     expect(provider.calls.filter(([m]) => m === 'postMessage')).toHaveLength(1);
   });
 
+  it('rejects a fresh in-flight reservation as a concurrent duplicate (never re-executes)', async () => {
+    const provider = fakeProvider();
+    const app = createApp(db, provider);
+    const connection = await createConnection(db);
+    const input = { connectionId: connection.id, channelId: 'C0123', text: 'once' };
+    // A reservation created just now (responseJson null) = a genuine in-flight sibling.
+    await db.idempotencyRecord.create({
+      data: { key: 'inflight-1', operation: 'send-message', requestHash: hashInput(input), responseJson: null },
+    });
+
+    const res = await request(app).post('/ops/send-message').set(AUTH).send({ ...input, idempotencyKey: 'inflight-1' });
+
+    expect(res.status).toBe(400);
+    expect(res.body.field).toBe('idempotencyKey');
+    expect(provider.calls.filter(([m]) => m === 'postMessage')).toHaveLength(0);
+  });
+
+  it('reclaims an ABANDONED (stale) in-flight reservation and re-executes, then replays', async () => {
+    const provider = fakeProvider();
+    const app = createApp(db, provider);
+    const connection = await createConnection(db);
+    const input = { connectionId: connection.id, channelId: 'C0123', text: 'once' };
+    // A reservation whose original request crashed / lost its completion write:
+    // in-flight but older than the stale window.
+    await db.idempotencyRecord.create({
+      data: {
+        key: 'abandoned-1',
+        operation: 'send-message',
+        requestHash: hashInput(input),
+        responseJson: null,
+        createdAt: new Date(Date.now() - 5 * 60 * 1000),
+      },
+    });
+
+    const res = await request(app).post('/ops/send-message').set(AUTH).send({ ...input, idempotencyKey: 'abandoned-1' });
+    expect(res.status).toBe(200);
+    expect(res.body.replayed).toBe(false);
+    expect(provider.calls.filter(([m]) => m === 'postMessage')).toHaveLength(1);
+
+    // The reclaimed reservation is now completed, so a further retry replays it.
+    const again = await request(app).post('/ops/send-message').set(AUTH).send({ ...input, idempotencyKey: 'abandoned-1' });
+    expect(again.body.replayed).toBe(true);
+    expect(provider.calls.filter(([m]) => m === 'postMessage')).toHaveLength(1);
+  });
+
+  it('reclaims a stale reservation atomically — two concurrent retries execute only once', async () => {
+    const provider = fakeProvider();
+    const app = createApp(db, provider);
+    const connection = await createConnection(db);
+    const input = { connectionId: connection.id, channelId: 'C0123', text: 'once' };
+    await db.idempotencyRecord.create({
+      data: {
+        key: 'race-1',
+        operation: 'send-message',
+        requestHash: hashInput(input),
+        responseJson: null,
+        createdAt: new Date(Date.now() - 5 * 60 * 1000),
+      },
+    });
+    const body = { ...input, idempotencyKey: 'race-1' };
+
+    const [a, b] = await Promise.all([
+      request(app).post('/ops/send-message').set(AUTH).send(body),
+      request(app).post('/ops/send-message').set(AUTH).send(body),
+    ]);
+
+    // The conditional claim lets exactly one retry re-execute the mutation,
+    // regardless of interleaving; the other replays or is told to retry.
+    expect(provider.calls.filter(([m]) => m === 'postMessage')).toHaveLength(1);
+    expect([a.status, b.status]).toContain(200);
+  });
+
   it('rejects an idempotency key reused with a different payload', async () => {
     const app = createApp(db, fakeProvider());
     const connection = await createConnection(db);
@@ -216,15 +288,30 @@ describe('POST /ops/respond', () => {
       .set(AUTH)
       .send({
         connectionId: connection.id,
-        responseUrl: 'https://hooks.slack.test/respond/abc',
+        responseUrl: 'https://hooks.slack.com/respond/abc',
         text: 'top hits: …',
       });
 
     expect(res.status).toBe(200);
     const [method, args] = provider.calls[0]!;
     expect(method).toBe('respondUrl');
-    expect(args[0]).toBe('https://hooks.slack.test/respond/abc');
+    expect(args[0]).toBe('https://hooks.slack.com/respond/abc');
     expect(args[1]).toMatchObject({ response_type: 'ephemeral', text: 'top hits: …' });
+  });
+
+  it('rejects a responseUrl that is not an https hooks.slack.com URL (SSRF guard)', async () => {
+    const provider = fakeProvider();
+    const app = createApp(db, provider);
+    const connection = await createConnection(db);
+
+    const res = await request(app)
+      .post('/ops/respond')
+      .set(AUTH)
+      .send({ connectionId: connection.id, responseUrl: 'http://169.254.169.254/latest/meta-data/', text: 'x' });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('validation_error');
+    expect(provider.calls.filter(([m]) => m === 'respondUrl')).toHaveLength(0);
   });
 });
 

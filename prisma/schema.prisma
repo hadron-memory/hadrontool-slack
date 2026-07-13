@@ -93,6 +93,12 @@ model IdempotencyRecord {
 /// gave hadrontool-telegram for free.
 model EventInbox {
   id           String @id @default(cuid())
+  /// Monotonic insertion sequence — the STABLE drain order. `createdAt`
+  /// alone is insufficient: two rows persisted in the same clock tick can
+  /// tie, and a tie lets the drainer reorder within a connection (breaking
+  /// the per-connection ordering guarantee) and stall the wrong row. A
+  /// BIGSERIAL never ties, so the drain orders by this, not by time.
+  seq          BigInt @default(autoincrement())
   connectionId String @map("connection_id")
   /// Socket Mode envelope id; synthetic (`gap:…`) for connection-lifecycle
   /// events that have no envelope. Unique per connection = ingress dedupe.
@@ -109,6 +115,6 @@ model EventInbox {
   connection Connection @relation(fields: [connectionId], references: [id])
 
   @@unique([connectionId, envelopeId])
-  @@index([status, createdAt])
+  @@index([status, seq])
   @@map("event_inbox")
 }

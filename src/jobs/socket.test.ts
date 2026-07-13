@@ -207,7 +207,7 @@ describe('drainInboxOnce', () => {
 
     // c1-second never attempted (order preserved); c2 unaffected.
     expect(seen).toEqual(['c1-first', 'c2-first']);
-    const remaining = await db.eventInbox.findMany({ orderBy: { createdAt: 'asc' } });
+    const remaining = await db.eventInbox.findMany({ orderBy: { seq: 'asc' } });
     expect(remaining.map((r) => r.envelopeId)).toEqual(['c1-first', 'c1-second']);
     expect(remaining[0]!.attempts).toBe(1);
     expect(remaining[1]!.attempts).toBe(0);
