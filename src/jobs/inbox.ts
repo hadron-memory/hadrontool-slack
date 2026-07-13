@@ -57,7 +57,11 @@ export async function persistEvent(db: Db, event: SlackEvent): Promise<boolean> 
 export async function drainInboxOnce(db: Db, forward: EventForwarder): Promise<number> {
   const rows = await db.eventInbox.findMany({
     where: { status: 'PENDING' },
-    orderBy: { createdAt: 'asc' },
+    // Order by the monotonic sequence, NOT createdAt: tied timestamps would
+    // otherwise let two rows in one connection reorder, and a failed
+    // delivery could then stall the wrong one — breaking per-connection
+    // ordering (spec 043 decision 5).
+    orderBy: { seq: 'asc' },
     take: DRAIN_BATCH,
   });
 
