@@ -171,6 +171,33 @@ describe('POST /ops/send-message', () => {
     expect(provider.calls.filter(([m]) => m === 'postMessage')).toHaveLength(1);
   });
 
+  it('reclaims a stale reservation atomically — two concurrent retries execute only once', async () => {
+    const provider = fakeProvider();
+    const app = createApp(db, provider);
+    const connection = await createConnection(db);
+    const input = { connectionId: connection.id, channelId: 'C0123', text: 'once' };
+    await db.idempotencyRecord.create({
+      data: {
+        key: 'race-1',
+        operation: 'send-message',
+        requestHash: hashInput(input),
+        responseJson: null,
+        createdAt: new Date(Date.now() - 5 * 60 * 1000),
+      },
+    });
+    const body = { ...input, idempotencyKey: 'race-1' };
+
+    const [a, b] = await Promise.all([
+      request(app).post('/ops/send-message').set(AUTH).send(body),
+      request(app).post('/ops/send-message').set(AUTH).send(body),
+    ]);
+
+    // The conditional claim lets exactly one retry re-execute the mutation,
+    // regardless of interleaving; the other replays or is told to retry.
+    expect(provider.calls.filter(([m]) => m === 'postMessage')).toHaveLength(1);
+    expect([a.status, b.status]).toContain(200);
+  });
+
   it('rejects an idempotency key reused with a different payload', async () => {
     const app = createApp(db, fakeProvider());
     const connection = await createConnection(db);

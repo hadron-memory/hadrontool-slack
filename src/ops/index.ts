@@ -386,7 +386,10 @@ function sleep(ms: number): Promise<void> {
  * rather than hanging on "still in flight" indefinitely.
  */
 async function storeCompletedResponse(db: Db, key: string, result: unknown): Promise<void> {
-  const responseJson = JSON.stringify(result);
+  // `?? null`: JSON.stringify(undefined) is `undefined`, which Prisma OMITS
+  // from the update — the row would stay responseJson=NULL (in-flight)
+  // forever. Serialize an undefined result to the JSON literal "null".
+  const responseJson = JSON.stringify(result ?? null);
   let lastErr: unknown;
   for (let attempt = 0; attempt < COMPLETION_STORE_ATTEMPTS; attempt++) {
     try {
@@ -451,11 +454,21 @@ export async function runOperation(
       if (ageMs < STALE_RESERVATION_MS) {
         throw new ValidationError('idempotencyKey', 'a request with this key is still in flight — retry shortly');
       }
-      // Reset the in-flight clock so concurrent duplicates during the
-      // re-execution see a fresh reservation, then fall through to run.
-      await db.idempotencyRecord
-        .update({ where: { key: idempotencyKey! }, data: { createdAt: new Date() } })
-        .catch(() => {});
+      // Claim the stale reservation ATOMICALLY: a conditional update that
+      // matches only while the row still carries the createdAt we observed
+      // (and no response). Under two concurrent reclaimers exactly one gets
+      // count===1 and re-executes; the loser sees count===0 (someone else
+      // bumped the clock or completed it) and backs off — so the
+      // "concurrent duplicate cannot also execute" guarantee holds even on
+      // the reclaim path. DB errors propagate (never swallowed).
+      const claim = await db.idempotencyRecord.updateMany({
+        where: { key: idempotencyKey!, responseJson: null, createdAt: existing.createdAt },
+        data: { createdAt: new Date() },
+      });
+      if (claim.count !== 1) {
+        throw new ValidationError('idempotencyKey', 'a request with this key is still in flight — retry shortly');
+      }
+      // Won the claim — fall through to re-execute.
     }
   }
 
