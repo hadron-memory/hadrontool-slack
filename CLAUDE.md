@@ -40,7 +40,7 @@ network.
 ## Where things live
 
 - Spec/plan: `hadron-server/specs/043-slack-integration/plan.md`; decision
-  node `hadronmemory.com::hadron-server::reference:hadrontool-slack`.
+  node `hrn:node:hadronmemory.com:hadron-server:reference:hadrontool-slack`.
 - Error codes are a PUBLIC contract (core's slackClient passes them through
   verbatim) — add codes, never change meanings (src/errors.ts).
 - The normalized message shape is shared by the get-history op AND the
