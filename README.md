@@ -13,7 +13,7 @@ Tool→core is the normalized events ingress only; core→tool is `/ops/*`
 only. When an op needs Hadron context, core passes it in the request.
 
 Design + decision record: `hadron-server/specs/043-slack-integration/plan.md`
-and `hrn:node:hadronmemory.com::hadron-server::reference:hadrontool-slack`.
+and `hrn:node:hadronmemory.com:hadron-server:reference:hadrontool-slack`.
 Pattern precedent: hadrontool-telegram (spec 042) — fourth application of
 the pattern (pdf → ms-exchange → telegram → slack).
 
