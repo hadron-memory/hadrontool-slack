@@ -10,7 +10,14 @@
  * spec 043 loop-prevention note — stores the tokens encrypted under its own
  * key, and returns the identity. Core stores only that identity — the
  * tokens never appear in any response or log.
+ *
+ * Idempotent registration (#4, tool half of hadron-server#4829): core may send
+ * an opaque `registrationKey` it derives from (App, credentials). A retry
+ * after a lost response re-derives it and gets the registration it created
+ * back (200, same body as the 201). Anyone else, including a legacy row with
+ * no key, keeps the 400, which names no connection id.
  */
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { Router } from 'express';
 import { z } from 'zod';
 import { encryptToken } from '../crypto.js';
@@ -23,7 +30,31 @@ import { respondWithError } from './respond.js';
 const createSchema = z.object({
   botToken: z.string().min(1),
   appToken: z.string().min(1),
+  /**
+   * Opaque idempotency key: 16-128 printable ASCII characters, derived by the
+   * caller from its own identity. A retry that reproduces it adopts the
+   * registration it created. Printable ASCII only, so no two distinct accepted
+   * keys can hash to the same bytes (a lone surrogate encodes like U+FFFD).
+   * The refusal text never echoes the value.
+   */
+  registrationKey: z
+    .string({ error: 'must be a string' })
+    .regex(/^[\x20-\x7e]{16,128}$/, 'must be 16-128 printable ASCII characters')
+    .optional(),
 });
+
+/** Digest stored for a key: the key itself is never persisted. */
+function keyDigest(key: string): string {
+  return createHash('sha256').update(key, 'utf8').digest('hex');
+}
+
+/** Constant-time digest equality; a NULL stored digest (legacy row) or no supplied key never matches. */
+function sameKey(stored: string | null, supplied: string | undefined): boolean {
+  if (!stored || supplied === undefined) return false;
+  const a = Buffer.from(stored, 'hex');
+  const b = Buffer.from(keyDigest(supplied), 'hex');
+  return a.length === b.length && timingSafeEqual(a, b);
+}
 
 /** Slack error codes that mean the CALLER's token input is bad at registration time. */
 const REGISTRATION_TOKEN_ERRORS = new Set(['invalid_auth', 'not_authed', 'account_inactive', 'token_revoked', 'token_expired']);
@@ -63,26 +94,53 @@ export function connectionsRouter(db: Db, provider: SlackProvider): Router {
       }
 
       // One active connection per workspace install: a second registration
-      // would start a competing Socket Mode client for the same app+team.
-      const existing = await db.connection.findFirst({
-        where: { teamId: me.teamId, botUserId: me.botUserId, deletedAt: null },
+      // would start a competing Socket Mode client for the same app+team. The
+      // check and the insert run under a per-install advisory lock so
+      // concurrent retries of one registration converge on one row.
+      const digest = input.registrationKey === undefined ? null : keyDigest(input.registrationKey);
+      const outcome = await db.$transaction(async (tx) => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`slack-register:${me.teamId}:${me.botUserId}`}))`;
+        const existing = await tx.connection.findFirst({
+          where: { teamId: me.teamId, botUserId: me.botUserId, deletedAt: null },
+        });
+        if (existing) {
+          // Adopted only by the caller that proves it created the row: the stored
+          // digest equals the supplied key's. A different key, a legacy NULL-key
+          // row and a keyless caller all keep the 400, which never names the
+          // other holder's connection id.
+          if (sameKey(existing.registrationKeyHash, input.registrationKey)) {
+            return { created: false as const, connection: existing };
+          }
+          throw new ValidationError('botToken', `a connection for ${me.teamName} already exists`);
+        }
+        // Adoption needs the install match AND the key: a key already held by an
+        // active connection of ANOTHER install is refused, never adopted and never
+        // re-used, and the refusal names neither install.
+        if (digest !== null) {
+          const elsewhere = await tx.connection.findFirst({
+            where: { registrationKeyHash: digest, deletedAt: null },
+            select: { id: true },
+          });
+          if (elsewhere) {
+            throw new ValidationError('registrationKey', 'the registration key belongs to another workspace install');
+          }
+        }
+        const connection = await tx.connection.create({
+          data: {
+            teamId: me.teamId,
+            teamName: me.teamName,
+            botUserId: me.botUserId,
+            botId: me.botId!,
+            botTokenEnc: encryptToken(input.botToken),
+            appTokenEnc: encryptToken(input.appToken),
+            registrationKeyHash: digest,
+          },
+        });
+        return { created: true as const, connection };
       });
-      if (existing) {
-        throw new ValidationError('botToken', `a connection for ${me.teamName} already exists (${existing.id})`);
-      }
-
-      const connection = await db.connection.create({
-        data: {
-          teamId: me.teamId,
-          teamName: me.teamName,
-          botUserId: me.botUserId,
-          botId: me.botId,
-          botTokenEnc: encryptToken(input.botToken),
-          appTokenEnc: encryptToken(input.appToken),
-        },
-      });
-      logInfo(`connection created for workspace ${connection.teamName} (${connection.id})`);
-      res.status(201).json({
+      const { connection } = outcome;
+      logInfo(`connection ${outcome.created ? 'created' : 'adopted'} for workspace ${connection.teamName} (${connection.id})`);
+      res.status(outcome.created ? 201 : 200).json({
         id: connection.id,
         provider: connection.provider,
         teamId: connection.teamId,
