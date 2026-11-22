@@ -5,6 +5,7 @@
 import request from 'supertest';
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createApp } from '../app.js';
+import { installLockKey, keyLockKey } from './connections.js';
 import { db } from '../db.js';
 import { SlackApiError } from '../providers/webapi/types.js';
 import { authInfo, fakeProvider, resetDb } from '../test/fakes.js';
@@ -213,6 +214,57 @@ describe('POST /connections registrationKey (#4, tool half of hadron-server#4829
     expect((await post(createApp(db, fakeProvider({ me: authInfo({ teamId: 'T0003' }) })), { registrationKey: 'x'.repeat(128) })).status).toBe(201);
   });
 
+  it('concurrent registrations of one key for DIFFERENT installs: at most one inserts, the rest are refused', async () => {
+    const teams = Array.from({ length: 8 }, (_, i) => `T9${i}`);
+    const results = await Promise.all(
+      teams.map((teamId) => post(createApp(db, fakeProvider({ me: authInfo({ teamId }) })), { registrationKey: KEY })),
+    );
+    expect(results.filter((r) => r.status === 201)).toHaveLength(1);
+    for (const r of results.filter((x) => x.status !== 201)) {
+      expect(r.status).toBe(400);
+      expect(r.body.field).toBe('registrationKey');
+    }
+    expect(await db.connection.count({ where: { deletedAt: null } })).toBe(1);
+  });
+
+  it('a keyed registration waits while another transaction holds that key lock, even for another install', async () => {
+    const { createHash } = await import('node:crypto');
+    const digest = createHash('sha256').update(KEY, 'utf8').digest('hex');
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let locked!: () => void;
+    const held = new Promise<void>((r) => (locked = r));
+    const holder = db.$transaction(
+      async (tx) => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${keyLockKey(digest)}))`;
+        locked();
+        await gate;
+      },
+      { timeout: 10_000 },
+    );
+    await held;
+    let done = false;
+    const pending = post(createApp(db, fakeProvider({ me: authInfo({ teamId: 'T0777' }) })), { registrationKey: KEY }).then(
+      (r) => ((done = true), r),
+    );
+    await new Promise((r) => setTimeout(r, 300));
+    expect(done).toBe(false);
+    release();
+    await holder;
+    expect((await pending).status).toBe(201);
+  });
+
+  it('GET /connections/:id never exposes the stored key digest', async () => {
+    const app = createApp(db, fakeProvider());
+    const created = await post(app, { registrationKey: KEY });
+    const got = await request(app).get(`/connections/${created.body.id}`).set(AUTH);
+    expect(got.status).toBe(200);
+    expect(got.body).not.toHaveProperty('registrationKeyHash');
+    const row = await db.connection.findUniqueOrThrow({ where: { id: created.body.id } });
+    expect(JSON.stringify(got.body)).not.toContain(row.registrationKeyHash!);
+    expect(JSON.stringify(created.body)).not.toContain(row.registrationKeyHash!);
+  });
+
   it('concurrent registrations with the same key converge on one row', async () => {
     const app = createApp(db, fakeProvider());
     const results = await Promise.all(Array.from({ length: 12 }, () => post(app, { registrationKey: KEY })));
@@ -231,7 +283,7 @@ describe('registration is serialized per workspace install (advisory lock)', () 
     const held = new Promise<void>((r) => (locked = r));
     const holder = db.$transaction(
       async (tx) => {
-        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${'slack-register:T0001:U0BOT'}))`;
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${installLockKey('T0001', 'U0BOT')}))`;
         locked();
         await gate;
       },

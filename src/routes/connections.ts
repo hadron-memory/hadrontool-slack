@@ -48,6 +48,16 @@ function keyDigest(key: string): string {
   return createHash('sha256').update(key, 'utf8').digest('hex');
 }
 
+/** The per-install advisory-lock key: one registration at a time per workspace install. */
+export function installLockKey(teamId: string, botUserId: string): string {
+  return `slack-register:${teamId}:${botUserId}`;
+}
+
+/** The per-key advisory-lock key: one registration at a time per registration key, across installs. */
+export function keyLockKey(digest: string): string {
+  return `slack-register-key:${digest}`;
+}
+
 /** Constant-time digest equality; a NULL stored digest (legacy row) or no supplied key never matches. */
 function sameKey(stored: string | null, supplied: string | undefined): boolean {
   if (!stored || supplied === undefined) return false;
@@ -80,7 +90,8 @@ export function connectionsRouter(db: Db, provider: SlackProvider): Router {
         }
         throw mapSlackError(err);
       }
-      if (!me.botId) {
+      const botId = me.botId;
+      if (!botId) {
         throw new ValidationError('botToken', 'the token does not belong to a bot user');
       }
 
@@ -96,10 +107,16 @@ export function connectionsRouter(db: Db, provider: SlackProvider): Router {
       // One active connection per workspace install: a second registration
       // would start a competing Socket Mode client for the same app+team. The
       // check and the insert run under a per-install advisory lock so
-      // concurrent retries of one registration converge on one row.
+      // concurrent retries of one registration converge on one row. A keyed
+      // registration also takes a per-key lock, so two DIFFERENT installs
+      // racing with one key cannot both insert it. Lock order is always
+      // install then key, so no two registrations wait on each other in a cycle.
       const digest = input.registrationKey === undefined ? null : keyDigest(input.registrationKey);
       const outcome = await db.$transaction(async (tx) => {
-        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`slack-register:${me.teamId}:${me.botUserId}`}))`;
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${installLockKey(me.teamId, me.botUserId)}))`;
+        if (digest !== null) {
+          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${keyLockKey(digest)}))`;
+        }
         const existing = await tx.connection.findFirst({
           where: { teamId: me.teamId, botUserId: me.botUserId, deletedAt: null },
         });
@@ -107,7 +124,10 @@ export function connectionsRouter(db: Db, provider: SlackProvider): Router {
           // Adopted only by the caller that proves it created the row: the stored
           // digest equals the supplied key's. A different key, a legacy NULL-key
           // row and a keyless caller all keep the 400, which never names the
-          // other holder's connection id.
+          // other holder's connection id. Adoption returns the row as stored and
+          // does not re-store the tokens: core derives the key from (App, bot
+          // token, app token), so a retry with rotated tokens carries a different
+          // key and is refused, never adopted with stale tokens.
           if (sameKey(existing.registrationKeyHash, input.registrationKey)) {
             return { created: false as const, connection: existing };
           }
@@ -130,7 +150,7 @@ export function connectionsRouter(db: Db, provider: SlackProvider): Router {
             teamId: me.teamId,
             teamName: me.teamName,
             botUserId: me.botUserId,
-            botId: me.botId!,
+            botId,
             botTokenEnc: encryptToken(input.botToken),
             appTokenEnc: encryptToken(input.appToken),
             registrationKeyHash: digest,
