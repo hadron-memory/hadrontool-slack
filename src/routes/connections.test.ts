@@ -354,7 +354,7 @@ describe('a repeat DELETE answers success for a connection already deleted (#6, 
         counts.push(r.count);
         return r;
       })) as never);
-    let results;
+    let results: request.Response[];
     try {
       results = await Promise.all(Array.from({ length: 6 }, () => request(app).delete(`/connections/${created.body.id}`).set(AUTH)));
     } finally {
